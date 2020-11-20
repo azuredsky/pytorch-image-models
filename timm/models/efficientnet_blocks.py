@@ -1,12 +1,14 @@
+""" EfficientNet, MobileNetV3, etc Blocks
 
-from functools import partial
+Hacked together by / Copyright 2020 Ross Wightman
+"""
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from .activations import sigmoid
-from .conv2d_layers import *
+from torch.nn import functional as F
 
+from .layers import create_conv2d, drop_path, get_act_layer
+from .layers.activations import sigmoid
 
 # Defaults used for Google/Tensorflow training of mobile networks /w RMSprop as per
 # papers and TF reference implementations. PT momentum equiv for TF decay is (1 - TF decay)
@@ -55,6 +57,13 @@ def resolve_se_args(kwargs, in_chs, act_layer=None):
     return se_kwargs
 
 
+def resolve_act_layer(kwargs, default='relu'):
+    act_layer = kwargs.pop('act_layer', default)
+    if isinstance(act_layer, str):
+        act_layer = get_act_layer(act_layer)
+    return act_layer
+
+
 def make_divisible(v, divisor=8, min_value=None):
     min_value = min_value or divisor
     new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
@@ -70,19 +79,6 @@ def round_channels(channels, multiplier=1.0, divisor=8, channel_min=None):
         return channels
     channels *= multiplier
     return make_divisible(channels, divisor, channel_min)
-
-
-def drop_connect(inputs, training=False, drop_connect_rate=0.):
-    """Apply drop connect."""
-    if not training:
-        return inputs
-
-    keep_prob = 1 - drop_connect_rate
-    random_tensor = keep_prob + torch.rand(
-        (inputs.size()[0], 1, 1, 1), dtype=inputs.dtype, device=inputs.device)
-    random_tensor.floor_()  # binarize
-    output = inputs.div(keep_prob) * random_tensor
-    return output
 
 
 class ChannelShuffle(nn.Module):
@@ -110,20 +106,18 @@ class SqueezeExcite(nn.Module):
     def __init__(self, in_chs, se_ratio=0.25, reduced_base_chs=None,
                  act_layer=nn.ReLU, gate_fn=sigmoid, divisor=1, **_):
         super(SqueezeExcite, self).__init__()
-        self.gate_fn = gate_fn
         reduced_chs = make_divisible((reduced_base_chs or in_chs) * se_ratio, divisor)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.conv_reduce = nn.Conv2d(in_chs, reduced_chs, 1, bias=True)
         self.act1 = act_layer(inplace=True)
         self.conv_expand = nn.Conv2d(reduced_chs, in_chs, 1, bias=True)
+        self.gate_fn = gate_fn
 
     def forward(self, x):
-        x_se = self.avg_pool(x)
+        x_se = x.mean((2, 3), keepdim=True)
         x_se = self.conv_reduce(x_se)
         x_se = self.act1(x_se)
         x_se = self.conv_expand(x_se)
-        x = x * self.gate_fn(x_se)
-        return x
+        return x * self.gate_fn(x_se)
 
 
 class ConvBnAct(nn.Module):
@@ -132,15 +126,16 @@ class ConvBnAct(nn.Module):
                  norm_layer=nn.BatchNorm2d, norm_kwargs=None):
         super(ConvBnAct, self).__init__()
         norm_kwargs = norm_kwargs or {}
-        self.conv = select_conv2d(in_chs, out_chs, kernel_size, stride=stride, dilation=dilation, padding=pad_type)
+        self.conv = create_conv2d(in_chs, out_chs, kernel_size, stride=stride, dilation=dilation, padding=pad_type)
         self.bn1 = norm_layer(out_chs, **norm_kwargs)
         self.act1 = act_layer(inplace=True)
 
-    def feature_module(self, location):
-        return 'act1'
-
-    def feature_channels(self, location):
-        return self.conv.out_channels
+    def feature_info(self, location):
+        if location == 'expansion':  # output of conv after act, same as block coutput
+            info = dict(module='act1', hook_type='forward', num_chs=self.conv.out_channels)
+        else:  # location == 'bottleneck', block output
+            info = dict(module='', hook_type='', num_chs=self.conv.out_channels)
+        return info
 
     def forward(self, x):
         x = self.conv(x)
@@ -157,34 +152,36 @@ class DepthwiseSeparableConv(nn.Module):
     def __init__(self, in_chs, out_chs, dw_kernel_size=3,
                  stride=1, dilation=1, pad_type='', act_layer=nn.ReLU, noskip=False,
                  pw_kernel_size=1, pw_act=False, se_ratio=0., se_kwargs=None,
-                 norm_layer=nn.BatchNorm2d, norm_kwargs=None, drop_connect_rate=0.):
+                 norm_layer=nn.BatchNorm2d, norm_kwargs=None, drop_path_rate=0.):
         super(DepthwiseSeparableConv, self).__init__()
         norm_kwargs = norm_kwargs or {}
-        self.has_se = se_ratio is not None and se_ratio > 0.
+        has_se = se_ratio is not None and se_ratio > 0.
         self.has_residual = (stride == 1 and in_chs == out_chs) and not noskip
         self.has_pw_act = pw_act  # activation after point-wise conv
-        self.drop_connect_rate = drop_connect_rate
+        self.drop_path_rate = drop_path_rate
 
-        self.conv_dw = select_conv2d(
+        self.conv_dw = create_conv2d(
             in_chs, in_chs, dw_kernel_size, stride=stride, dilation=dilation, padding=pad_type, depthwise=True)
         self.bn1 = norm_layer(in_chs, **norm_kwargs)
         self.act1 = act_layer(inplace=True)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if has_se:
             se_kwargs = resolve_se_args(se_kwargs, in_chs, act_layer)
             self.se = SqueezeExcite(in_chs, se_ratio=se_ratio, **se_kwargs)
+        else:
+            self.se = None
 
-        self.conv_pw = select_conv2d(in_chs, out_chs, pw_kernel_size, padding=pad_type)
+        self.conv_pw = create_conv2d(in_chs, out_chs, pw_kernel_size, padding=pad_type)
         self.bn2 = norm_layer(out_chs, **norm_kwargs)
         self.act2 = act_layer(inplace=True) if self.has_pw_act else nn.Identity()
 
-    def feature_module(self, location):
-        # no expansion in this block, pre pw only feature extraction point
-        return 'conv_pw'
-
-    def feature_channels(self, location):
-        return self.conv_pw.in_channels
+    def feature_info(self, location):
+        if location == 'expansion':  # after SE, input to PW
+            info = dict(module='conv_pw', hook_type='forward_pre', num_chs=self.conv_pw.in_channels)
+        else:  # location == 'bottleneck', block output
+            info = dict(module='', hook_type='', num_chs=self.conv_pw.out_channels)
+        return info
 
     def forward(self, x):
         residual = x
@@ -193,7 +190,7 @@ class DepthwiseSeparableConv(nn.Module):
         x = self.bn1(x)
         x = self.act1(x)
 
-        if self.has_se:
+        if self.se is not None:
             x = self.se(x)
 
         x = self.conv_pw(x)
@@ -201,8 +198,8 @@ class DepthwiseSeparableConv(nn.Module):
         x = self.act2(x)
 
         if self.has_residual:
-            if self.drop_connect_rate > 0.:
-                x = drop_connect(x, self.training, self.drop_connect_rate)
+            if self.drop_path_rate > 0.:
+                x = drop_path(x, self.drop_path_rate, self.training)
             x += residual
         return x
 
@@ -214,46 +211,44 @@ class InvertedResidual(nn.Module):
                  stride=1, dilation=1, pad_type='', act_layer=nn.ReLU, noskip=False,
                  exp_ratio=1.0, exp_kernel_size=1, pw_kernel_size=1,
                  se_ratio=0., se_kwargs=None, norm_layer=nn.BatchNorm2d, norm_kwargs=None,
-                 conv_kwargs=None, drop_connect_rate=0.):
+                 conv_kwargs=None, drop_path_rate=0.):
         super(InvertedResidual, self).__init__()
         norm_kwargs = norm_kwargs or {}
         conv_kwargs = conv_kwargs or {}
         mid_chs = make_divisible(in_chs * exp_ratio)
-        self.has_se = se_ratio is not None and se_ratio > 0.
+        has_se = se_ratio is not None and se_ratio > 0.
         self.has_residual = (in_chs == out_chs and stride == 1) and not noskip
-        self.drop_connect_rate = drop_connect_rate
+        self.drop_path_rate = drop_path_rate
 
         # Point-wise expansion
-        self.conv_pw = select_conv2d(in_chs, mid_chs, exp_kernel_size, padding=pad_type, **conv_kwargs)
+        self.conv_pw = create_conv2d(in_chs, mid_chs, exp_kernel_size, padding=pad_type, **conv_kwargs)
         self.bn1 = norm_layer(mid_chs, **norm_kwargs)
         self.act1 = act_layer(inplace=True)
 
         # Depth-wise convolution
-        self.conv_dw = select_conv2d(
+        self.conv_dw = create_conv2d(
             mid_chs, mid_chs, dw_kernel_size, stride=stride, dilation=dilation,
             padding=pad_type, depthwise=True, **conv_kwargs)
         self.bn2 = norm_layer(mid_chs, **norm_kwargs)
         self.act2 = act_layer(inplace=True)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if has_se:
             se_kwargs = resolve_se_args(se_kwargs, in_chs, act_layer)
             self.se = SqueezeExcite(mid_chs, se_ratio=se_ratio, **se_kwargs)
+        else:
+            self.se = None
 
         # Point-wise linear projection
-        self.conv_pwl = select_conv2d(mid_chs, out_chs, pw_kernel_size, padding=pad_type, **conv_kwargs)
+        self.conv_pwl = create_conv2d(mid_chs, out_chs, pw_kernel_size, padding=pad_type, **conv_kwargs)
         self.bn3 = norm_layer(out_chs, **norm_kwargs)
 
-    def feature_module(self, location):
-        if location == 'post_exp':
-            return 'act1'
-        return 'conv_pwl'
-
-    def feature_channels(self, location):
-        if location == 'post_exp':
-            return self.conv_pw.out_channels
-        # location == 'pre_pw'
-        return self.conv_pwl.in_channels
+    def feature_info(self, location):
+        if location == 'expansion':  # after SE, input to PWL
+            info = dict(module='conv_pwl', hook_type='forward_pre', num_chs=self.conv_pwl.in_channels)
+        else:  # location == 'bottleneck', block output
+            info = dict(module='', hook_type='', num_chs=self.conv_pwl.out_channels)
+        return info
 
     def forward(self, x):
         residual = x
@@ -269,7 +264,7 @@ class InvertedResidual(nn.Module):
         x = self.act2(x)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if self.se is not None:
             x = self.se(x)
 
         # Point-wise linear projection
@@ -277,8 +272,8 @@ class InvertedResidual(nn.Module):
         x = self.bn3(x)
 
         if self.has_residual:
-            if self.drop_connect_rate > 0.:
-                x = drop_connect(x, self.training, self.drop_connect_rate)
+            if self.drop_path_rate > 0.:
+                x = drop_path(x, self.drop_path_rate, self.training)
             x += residual
 
         return x
@@ -291,7 +286,7 @@ class CondConvResidual(InvertedResidual):
                  stride=1, dilation=1, pad_type='', act_layer=nn.ReLU, noskip=False,
                  exp_ratio=1.0, exp_kernel_size=1, pw_kernel_size=1,
                  se_ratio=0., se_kwargs=None, norm_layer=nn.BatchNorm2d, norm_kwargs=None,
-                 num_experts=0, drop_connect_rate=0.):
+                 num_experts=0, drop_path_rate=0.):
 
         self.num_experts = num_experts
         conv_kwargs = dict(num_experts=self.num_experts)
@@ -301,7 +296,7 @@ class CondConvResidual(InvertedResidual):
             act_layer=act_layer, noskip=noskip, exp_ratio=exp_ratio, exp_kernel_size=exp_kernel_size,
             pw_kernel_size=pw_kernel_size, se_ratio=se_ratio, se_kwargs=se_kwargs,
             norm_layer=norm_layer, norm_kwargs=norm_kwargs, conv_kwargs=conv_kwargs,
-            drop_connect_rate=drop_connect_rate)
+            drop_path_rate=drop_path_rate)
 
         self.routing_fn = nn.Linear(in_chs, self.num_experts)
 
@@ -323,7 +318,7 @@ class CondConvResidual(InvertedResidual):
         x = self.act2(x)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if self.se is not None:
             x = self.se(x)
 
         # Point-wise linear projection
@@ -331,8 +326,8 @@ class CondConvResidual(InvertedResidual):
         x = self.bn3(x)
 
         if self.has_residual:
-            if self.drop_connect_rate > 0.:
-                x = drop_connect(x, self.training, self.drop_connect_rate)
+            if self.drop_path_rate > 0.:
+                x = drop_path(x, self.drop_path_rate, self.training)
             x += residual
         return x
 
@@ -343,42 +338,40 @@ class EdgeResidual(nn.Module):
     def __init__(self, in_chs, out_chs, exp_kernel_size=3, exp_ratio=1.0, fake_in_chs=0,
                  stride=1, dilation=1, pad_type='', act_layer=nn.ReLU, noskip=False, pw_kernel_size=1,
                  se_ratio=0., se_kwargs=None, norm_layer=nn.BatchNorm2d, norm_kwargs=None,
-                 drop_connect_rate=0.):
+                 drop_path_rate=0.):
         super(EdgeResidual, self).__init__()
         norm_kwargs = norm_kwargs or {}
         if fake_in_chs > 0:
             mid_chs = make_divisible(fake_in_chs * exp_ratio)
         else:
             mid_chs = make_divisible(in_chs * exp_ratio)
-        self.has_se = se_ratio is not None and se_ratio > 0.
+        has_se = se_ratio is not None and se_ratio > 0.
         self.has_residual = (in_chs == out_chs and stride == 1) and not noskip
-        self.drop_connect_rate = drop_connect_rate
+        self.drop_path_rate = drop_path_rate
 
         # Expansion convolution
-        self.conv_exp = select_conv2d(in_chs, mid_chs, exp_kernel_size, padding=pad_type)
+        self.conv_exp = create_conv2d(in_chs, mid_chs, exp_kernel_size, padding=pad_type)
         self.bn1 = norm_layer(mid_chs, **norm_kwargs)
         self.act1 = act_layer(inplace=True)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if has_se:
             se_kwargs = resolve_se_args(se_kwargs, in_chs, act_layer)
             self.se = SqueezeExcite(mid_chs, se_ratio=se_ratio, **se_kwargs)
+        else:
+            self.se = None
 
         # Point-wise linear projection
-        self.conv_pwl = select_conv2d(
+        self.conv_pwl = create_conv2d(
             mid_chs, out_chs, pw_kernel_size, stride=stride, dilation=dilation, padding=pad_type)
         self.bn2 = norm_layer(out_chs, **norm_kwargs)
 
-    def feature_module(self, location):
-        if location == 'post_exp':
-            return 'act1'
-        return 'conv_pwl'
-
-    def feature_channels(self, location):
-        if location == 'post_exp':
-            return self.conv_exp.out_channels
-        # location == 'pre_pw'
-        return self.conv_pwl.in_channels
+    def feature_info(self, location):
+        if location == 'expansion':  # after SE, before PWL
+            info = dict(module='conv_pwl', hook_type='forward_pre', num_chs=self.conv_pwl.in_channels)
+        else:  # location == 'bottleneck', block output
+            info = dict(module='', hook_type='', num_chs=self.conv_pwl.out_channels)
+        return info
 
     def forward(self, x):
         residual = x
@@ -389,7 +382,7 @@ class EdgeResidual(nn.Module):
         x = self.act1(x)
 
         # Squeeze-and-excitation
-        if self.has_se:
+        if self.se is not None:
             x = self.se(x)
 
         # Point-wise linear projection
@@ -397,8 +390,8 @@ class EdgeResidual(nn.Module):
         x = self.bn2(x)
 
         if self.has_residual:
-            if self.drop_connect_rate > 0.:
-                x = drop_connect(x, self.training, self.drop_connect_rate)
+            if self.drop_path_rate > 0.:
+                x = drop_path(x, self.drop_path_rate, self.training)
             x += residual
 
         return x
